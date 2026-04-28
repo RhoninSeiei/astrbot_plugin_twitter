@@ -218,9 +218,17 @@ class TwitterPlugin(Star):
         """获取 KV 中保存的订阅数据"""
         return self._normalize_subs(await self.get_kv_data(KV_SUBS_KEY, {}))
 
+    def _config_subscriptions_configured(self) -> bool:
+        """判断面板订阅配置是否已经接管订阅关系"""
+        return self.config is not None and CONFIG_SUBS_KEY in self.config
+
     def _get_config_subscription_entries(self) -> list[dict]:
         """获取面板配置中的订阅条目"""
-        entries = self.config.get(CONFIG_SUBS_KEY, []) if self.config else []
+        entries = (
+            self.config.get(CONFIG_SUBS_KEY, [])
+            if self.config is not None
+            else []
+        )
         if not isinstance(entries, list):
             return []
         return [entry for entry in entries if isinstance(entry, dict)]
@@ -260,9 +268,9 @@ class TwitterPlugin(Star):
 
     async def _get_subs(self) -> dict:
         """获取 KV 与面板配置合并后的订阅数据"""
-        kv_subs = await self._get_raw_subs()
-        config_subs = self._config_subscriptions_to_subs()
-        return self._merge_subs(kv_subs, config_subs)
+        if self._config_subscriptions_configured():
+            return self._config_subscriptions_to_subs()
+        return await self._get_raw_subs()
 
     async def _put_subs_unlocked(self, data: dict):
         await self.put_kv_data(KV_SUBS_KEY, self._normalize_subs(data))
@@ -271,13 +279,16 @@ class TwitterPlugin(Star):
         """保存全部订阅数据，并处理 SharedPreferences 并发插入冲突"""
         async with self._subs_lock:
             payload = self._normalize_subs(data)
-            if merge_existing:
+            if merge_existing and not self._config_subscriptions_configured():
                 payload = self._merge_subs(await self._get_raw_subs(), payload)
             try:
                 await self._put_subs_unlocked(payload)
             except Exception as e:
                 if PREFERENCE_UNIQUE_ERROR not in str(e):
                     raise
+                if self._config_subscriptions_configured():
+                    await self._put_subs_unlocked(payload)
+                    return
                 latest = await self._get_raw_subs()
                 await self._put_subs_unlocked(self._merge_subs(latest, payload))
 
@@ -395,6 +406,9 @@ class TwitterPlugin(Star):
 
     async def _sync_kv_subscriptions_to_config(self):
         """将历史 KV 订阅补充到面板配置"""
+        if self._config_subscriptions_configured():
+            return
+
         raw_subs = await self._get_raw_subs()
         if not raw_subs:
             return

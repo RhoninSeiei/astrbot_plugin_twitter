@@ -273,6 +273,73 @@ class SubscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(entries[0]["r18"])
         self.assertTrue(entries[0]["media"])
 
+    async def test_panel_deleted_subscription_is_not_restored_from_kv(self):
+        plugin = MemoryTwitterPlugin({"twitter_subscriptions": []})
+        plugin.store = {
+            "alice": {
+                "screen_name": "Alice",
+                "since_id": "42",
+                "subscribers": {
+                    "qq2:GroupMessage:123": {
+                        "status": True,
+                        "r18": False,
+                        "media": True,
+                    }
+                },
+            }
+        }
+
+        await plugin._sync_kv_subscriptions_to_config()
+        subs = await plugin._get_subs()
+
+        self.assertEqual(plugin.config["twitter_subscriptions"], [])
+        self.assertNotIn("alice", subs)
+        self.assertEqual(plugin.config.save_count, 0)
+
+    async def test_panel_changed_umo_removes_old_umo_from_runtime_and_kv(self):
+        plugin = MemoryTwitterPlugin(
+            {
+                "twitter_subscriptions": [
+                    {
+                        "__template_key": "subscription",
+                        "username": "alice",
+                        "unified_msg_origin": "qq2:GroupMessage:new",
+                        "enabled": True,
+                        "r18": True,
+                        "media": False,
+                        "screen_name": "Alice",
+                        "since_id": "42",
+                    }
+                ]
+            }
+        )
+        plugin.store = {
+            "alice": {
+                "screen_name": "Alice",
+                "since_id": "42",
+                "subscribers": {
+                    "qq2:GroupMessage:old": {
+                        "status": True,
+                        "r18": False,
+                        "media": True,
+                    }
+                },
+            }
+        }
+
+        subs = await plugin._get_subs()
+        await plugin._save_subs(subs)
+
+        self.assertIn("alice", subs)
+        self.assertIn("qq2:GroupMessage:new", subs["alice"]["subscribers"])
+        self.assertNotIn("qq2:GroupMessage:old", subs["alice"]["subscribers"])
+        self.assertIn("qq2:GroupMessage:new", plugin.store["alice"]["subscribers"])
+        self.assertNotIn("qq2:GroupMessage:old", plugin.store["alice"]["subscribers"])
+        self.assertEqual(
+            plugin.store["alice"]["subscribers"]["qq2:GroupMessage:new"],
+            {"status": True, "r18": True, "media": False},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
