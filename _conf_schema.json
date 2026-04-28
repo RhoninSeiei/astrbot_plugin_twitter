@@ -50,6 +50,7 @@
     "description": "翻译使用的 LLM Provider ID（留空则自动选择）",
     "type": "string",
     "default": "",
+    "_special": "select_provider",
     "hint": "指定翻译用的 Provider ID，留空时按以下顺序自动选择：当前会话 Provider → 第一个可用 Provider"
   },
   "twitter_no_text": {
@@ -62,5 +63,58 @@
     "type": "bool",
     "default": true,
     "hint": "关闭后，聊天中出现 twitter.com / x.com 链接时不再自动解析推文内容"
+  },
+  "twitter_subscriptions": {
+    "description": "UMO 订阅配置",
+    "type": "template_list",
+    "default": [],
+    "hint": "在面板中维护推主到群聊或私聊的推送关系。UMO 格式为 平台:消息类型:会话ID，例如 qq2:GroupMessage:851926461 或 default:FriendMessage:123456。",
+    "templates": {
+      "subscription": {
+        "name": "Twitter 订阅",
+        "hint": "配置一个推主和一个 AstrBot 会话之间的推送关系",
+        "items": {
+          "username": {
+            "description": "推主 ID",
+            "type": "string",
+            "default": "",
+            "hint": "填写 Twitter/X 用户名，可带 @"
+          },
+          "unified_msg_origin": {
+            "description": "统一会话标识 UMO",
+            "type": "string",
+            "default": "",
+            "hint": "格式为 平台:消息类型:会话ID，例如 qq2:GroupMessage:851926461"
+          },
+          "enabled": {
+            "description": "启用推送",
+            "type": "bool",
+            "default": true
+          },
+          "r18": {
+            "description": "接收 R18 内容",
+            "type": "bool",
+            "default": false
+          },
+          "media": {
+            "description": "仅推送含图片推文",
+            "type": "bool",
+            "default": false
+          },
+          "screen_name": {
+            "description": "显示昵称",
+            "type": "string",
+            "default": "",
+            "hint": "可留空，聊天命令订阅或轮询后会尽量补全"
+          },
+          "since_id": {
+            "description": "推文游标",
+            "type": "string",
+            "default": "",
+            "hint": "可留空；留空时首次轮询会以当前最新推文建立游标"
+          }
+        }
+      }
+    }
   }
 }

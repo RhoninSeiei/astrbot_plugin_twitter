@@ -22,6 +22,7 @@ AstrBot Twitter 推文转发插件
 
 import asyncio
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 from astrbot.api import AstrBotConfig, logger
@@ -39,6 +40,8 @@ TWITTER_LINK_PATTERN = re.compile(
 
 # KV 存储键名
 KV_SUBS_KEY = "twitter_subs"
+CONFIG_SUBS_KEY = "twitter_subscriptions"
+PREFERENCE_UNIQUE_ERROR = "UNIQUE constraint failed: preferences.scope"
 
 
 @dataclass
@@ -98,6 +101,7 @@ class TwitterPlugin(Star):
 
         # 集体转发推文缓存：{umo: [CachedTweet, ...]}
         self._collected_tweets: dict[str, list[CachedTweet]] = {}
+        self._subs_lock = asyncio.Lock()
 
     async def initialize(self):
         """插件初始化"""
@@ -109,6 +113,11 @@ class TwitterPlugin(Star):
                 "集体转发模式已开启但合并转发消息未开启，集体转发功能不会生效。"
                 "请同时开启「使用合并转发消息」配置项。"
             )
+
+        try:
+            await self._sync_kv_subscriptions_to_config()
+        except Exception as e:
+            logger.warning(f"同步历史订阅到面板配置失败: {e}")
 
         # 检测可用镜像站
         available = await self.twitter_api.check_website_available(self.website_list)
@@ -143,13 +152,287 @@ class TwitterPlugin(Star):
 
     # ========== 数据管理（KV 存储） ==========
 
-    async def _get_subs(self) -> dict:
-        """获取全部订阅数据"""
-        return await self.get_kv_data(KV_SUBS_KEY, {})
+    @staticmethod
+    def _normalize_username(username: str) -> str:
+        """规范化推主用户名"""
+        return str(username or "").strip().strip("@").strip()
 
-    async def _save_subs(self, data: dict):
-        """保存全部订阅数据"""
-        await self.put_kv_data(KV_SUBS_KEY, data)
+    @staticmethod
+    def _normalize_sub_config(sub_config: dict | None) -> dict:
+        """规范化订阅配置"""
+        sub_config = sub_config or {}
+        return {
+            "status": bool(sub_config.get("status", True)),
+            "r18": bool(sub_config.get("r18", False)),
+            "media": bool(sub_config.get("media", False)),
+        }
+
+    def _normalize_subs(self, data: dict | None) -> dict:
+        """规范化订阅数据结构"""
+        if not isinstance(data, dict):
+            return {}
+
+        normalized: dict = {}
+        for username, info in data.items():
+            username = self._normalize_username(username)
+            if not username or not isinstance(info, dict):
+                continue
+
+            subscribers = {}
+            raw_subscribers = info.get("subscribers") or {}
+            if isinstance(raw_subscribers, dict):
+                for umo, sub_config in raw_subscribers.items():
+                    umo = str(umo or "").strip()
+                    if umo:
+                        subscribers[umo] = self._normalize_sub_config(sub_config)
+
+            normalized[username] = {
+                "screen_name": str(info.get("screen_name") or username),
+                "since_id": str(info.get("since_id") or ""),
+                "subscribers": subscribers,
+            }
+
+        return normalized
+
+    def _merge_subs(self, base: dict | None, overlay: dict | None) -> dict:
+        """合并两份订阅数据，overlay 覆盖同一推主和 UMO 的订阅配置"""
+        merged = self._normalize_subs(deepcopy(base or {}))
+        overlay = self._normalize_subs(deepcopy(overlay or {}))
+
+        for username, info in overlay.items():
+            if username not in merged:
+                merged[username] = info
+                continue
+
+            if info.get("screen_name"):
+                merged[username]["screen_name"] = info["screen_name"]
+            if info.get("since_id"):
+                merged[username]["since_id"] = info["since_id"]
+
+            merged[username].setdefault("subscribers", {})
+            merged[username]["subscribers"].update(info.get("subscribers") or {})
+
+        return merged
+
+    async def _get_raw_subs(self) -> dict:
+        """获取 KV 中保存的订阅数据"""
+        return self._normalize_subs(await self.get_kv_data(KV_SUBS_KEY, {}))
+
+    def _get_config_subscription_entries(self) -> list[dict]:
+        """获取面板配置中的订阅条目"""
+        entries = self.config.get(CONFIG_SUBS_KEY, []) if self.config else []
+        if not isinstance(entries, list):
+            return []
+        return [entry for entry in entries if isinstance(entry, dict)]
+
+    def _config_subscriptions_to_subs(self) -> dict:
+        """将面板 UMO 订阅配置转换为运行态订阅结构"""
+        subs: dict = {}
+        for entry in self._get_config_subscription_entries():
+            username = self._normalize_username(entry.get("username", ""))
+            umo = str(
+                entry.get("unified_msg_origin")
+                or entry.get("umo")
+                or ""
+            ).strip()
+            if not username or not umo:
+                continue
+
+            if username not in subs:
+                subs[username] = {
+                    "screen_name": str(entry.get("screen_name") or username),
+                    "since_id": str(entry.get("since_id") or ""),
+                    "subscribers": {},
+                }
+            elif entry.get("screen_name"):
+                subs[username]["screen_name"] = str(entry.get("screen_name"))
+
+            if entry.get("since_id"):
+                subs[username]["since_id"] = str(entry.get("since_id"))
+
+            subs[username]["subscribers"][umo] = {
+                "status": bool(entry.get("enabled", True)),
+                "r18": bool(entry.get("r18", False)),
+                "media": bool(entry.get("media", False)),
+            }
+
+        return self._normalize_subs(subs)
+
+    async def _get_subs(self) -> dict:
+        """获取 KV 与面板配置合并后的订阅数据"""
+        kv_subs = await self._get_raw_subs()
+        config_subs = self._config_subscriptions_to_subs()
+        return self._merge_subs(kv_subs, config_subs)
+
+    async def _put_subs_unlocked(self, data: dict):
+        await self.put_kv_data(KV_SUBS_KEY, self._normalize_subs(data))
+
+    async def _save_subs(self, data: dict, merge_existing: bool = True):
+        """保存全部订阅数据，并处理 SharedPreferences 并发插入冲突"""
+        async with self._subs_lock:
+            payload = self._normalize_subs(data)
+            if merge_existing:
+                payload = self._merge_subs(await self._get_raw_subs(), payload)
+            try:
+                await self._put_subs_unlocked(payload)
+            except Exception as e:
+                if PREFERENCE_UNIQUE_ERROR not in str(e):
+                    raise
+                latest = await self._get_raw_subs()
+                await self._put_subs_unlocked(self._merge_subs(latest, payload))
+
+    def _save_config_subscriptions(self, entries: list[dict]):
+        """保存面板订阅配置"""
+        if self.config is None:
+            return
+        self.config[CONFIG_SUBS_KEY] = entries
+        save_config = getattr(self.config, "save_config", None)
+        if callable(save_config):
+            save_config()
+
+    def _upsert_config_subscription(
+        self,
+        username: str,
+        umo: str,
+        session_config: dict,
+        screen_name: str = "",
+        since_id: str = "",
+    ):
+        """将聊天命令产生的订阅同步到面板配置"""
+        username = self._normalize_username(username)
+        umo = str(umo or "").strip()
+        if not username or not umo:
+            return
+
+        entries = deepcopy(self._get_config_subscription_entries())
+        found = False
+        for entry in entries:
+            if (
+                self._normalize_username(entry.get("username", "")) == username
+                and str(entry.get("unified_msg_origin") or "").strip() == umo
+            ):
+                entry["username"] = username
+                entry["unified_msg_origin"] = umo
+                entry["enabled"] = bool(session_config.get("status", True))
+                entry["r18"] = bool(session_config.get("r18", False))
+                entry["media"] = bool(session_config.get("media", False))
+                if screen_name:
+                    entry["screen_name"] = screen_name
+                if since_id:
+                    entry["since_id"] = since_id
+                entry.setdefault("__template_key", "subscription")
+                found = True
+                break
+
+        if not found:
+            entries.append(
+                {
+                    "__template_key": "subscription",
+                    "username": username,
+                    "unified_msg_origin": umo,
+                    "enabled": bool(session_config.get("status", True)),
+                    "r18": bool(session_config.get("r18", False)),
+                    "media": bool(session_config.get("media", False)),
+                    "screen_name": screen_name or username,
+                    "since_id": since_id or "",
+                }
+            )
+
+        self._save_config_subscriptions(entries)
+
+    def _remove_config_subscription(self, username: str, umo: str) -> bool:
+        """从面板配置删除指定订阅"""
+        username = self._normalize_username(username)
+        umo = str(umo or "").strip()
+        entries = deepcopy(self._get_config_subscription_entries())
+        next_entries = [
+            entry
+            for entry in entries
+            if not (
+                self._normalize_username(entry.get("username", "")) == username
+                and str(entry.get("unified_msg_origin") or "").strip() == umo
+            )
+        ]
+        changed = len(next_entries) != len(entries)
+        if changed:
+            self._save_config_subscriptions(next_entries)
+        return changed
+
+    def _set_config_umo_status(self, umo: str, enabled: bool) -> int:
+        """更新面板配置中指定 UMO 的推送状态"""
+        umo = str(umo or "").strip()
+        entries = deepcopy(self._get_config_subscription_entries())
+        count = 0
+        for entry in entries:
+            if str(entry.get("unified_msg_origin") or "").strip() == umo:
+                entry["enabled"] = enabled
+                entry.setdefault("__template_key", "subscription")
+                count += 1
+        if count:
+            self._save_config_subscriptions(entries)
+        return count
+
+    def _clear_config_subscriptions(self):
+        """清空面板订阅配置"""
+        self._save_config_subscriptions([])
+
+    def _update_config_since_id(self, username: str, since_id: str, screen_name: str):
+        """更新面板订阅条目的游标信息"""
+        username = self._normalize_username(username)
+        if not username or not since_id:
+            return
+        entries = deepcopy(self._get_config_subscription_entries())
+        changed = False
+        for entry in entries:
+            if self._normalize_username(entry.get("username", "")) == username:
+                entry["since_id"] = str(since_id)
+                if screen_name:
+                    entry["screen_name"] = screen_name
+                entry.setdefault("__template_key", "subscription")
+                changed = True
+        if changed:
+            self._save_config_subscriptions(entries)
+
+    async def _sync_kv_subscriptions_to_config(self):
+        """将历史 KV 订阅补充到面板配置"""
+        raw_subs = await self._get_raw_subs()
+        if not raw_subs:
+            return
+
+        entries = deepcopy(self._get_config_subscription_entries())
+        existing = {
+            (
+                self._normalize_username(entry.get("username", "")),
+                str(entry.get("unified_msg_origin") or "").strip(),
+            )
+            for entry in entries
+        }
+        changed = False
+
+        for username, info in raw_subs.items():
+            subscribers = info.get("subscribers") or {}
+            for umo, sub_config in subscribers.items():
+                key = (self._normalize_username(username), str(umo or "").strip())
+                if not key[0] or not key[1] or key in existing:
+                    continue
+                normalized_config = self._normalize_sub_config(sub_config)
+                entries.append(
+                    {
+                        "__template_key": "subscription",
+                        "username": key[0],
+                        "unified_msg_origin": key[1],
+                        "enabled": normalized_config["status"],
+                        "r18": normalized_config["r18"],
+                        "media": normalized_config["media"],
+                        "screen_name": str(info.get("screen_name") or key[0]),
+                        "since_id": str(info.get("since_id") or ""),
+                    }
+                )
+                existing.add(key)
+                changed = True
+
+        if changed:
+            self._save_config_subscriptions(entries)
 
     # ========== 工具方法 ==========
 
@@ -781,6 +1064,11 @@ class TwitterPlugin(Star):
             subs = await self._get_subs()
             if username in subs:
                 subs[username]["since_id"] = new_tweet_ids[-1]
+                self._update_config_since_id(
+                    username,
+                    new_tweet_ids[-1],
+                    str(subs[username].get("screen_name") or username),
+                )
                 await self._save_subs(subs)
 
             return True
@@ -841,6 +1129,13 @@ class TwitterPlugin(Star):
         if since_id:
             subs[username]["since_id"] = since_id
 
+        self._upsert_config_subscription(
+            username,
+            umo,
+            session_config,
+            screen_name=user_info["screen_name"],
+            since_id=since_id,
+        )
         await self._save_subs(subs)
 
         r18_str = " | R18" if r18 else ""
@@ -917,6 +1212,14 @@ class TwitterPlugin(Star):
                 if since_id:
                     subs[username]["since_id"] = since_id
 
+                self._upsert_config_subscription(
+                    username,
+                    umo,
+                    session_config,
+                    screen_name=user_info["screen_name"],
+                    since_id=since_id,
+                )
+
                 success_count += 1
                 r18_str = " | R18" if r18 else ""
                 media_str = " | 仅媒体" if media_only else ""
@@ -957,12 +1260,13 @@ class TwitterPlugin(Star):
             return
 
         subs[username]["subscribers"].pop(umo)
+        self._remove_config_subscription(username, umo)
 
         # 如果该推主没有任何订阅者了，删除该推主
         if not subs[username].get("subscribers", {}):
             subs.pop(username)
 
-        await self._save_subs(subs)
+        await self._save_subs(subs, merge_existing=False)
         yield event.plain_result(f"已取关 {username}")
 
     @filter.command("推特批量取关", alias={"twitter_batch_unfollow"})
@@ -993,6 +1297,7 @@ class TwitterPlugin(Star):
                 continue
 
             subs[username]["subscribers"].pop(umo)
+            self._remove_config_subscription(username, umo)
 
             # 如果该推主没有任何订阅者了，删除该推主
             if not subs[username].get("subscribers", {}):
@@ -1002,7 +1307,7 @@ class TwitterPlugin(Star):
             results.append(f"✅ @{username} - 已取关")
 
         # 一次性保存所有变更
-        await self._save_subs(subs)
+        await self._save_subs(subs, merge_existing=False)
 
         # 汇总结果
         summary = (
@@ -1025,7 +1330,8 @@ class TwitterPlugin(Star):
             len(info.get("subscribers", {})) for info in subs.values()
         )
 
-        await self._save_subs({})
+        self._clear_config_subscriptions()
+        await self._save_subs({}, merge_existing=False)
         # 清空集体转发缓存
         self._collected_tweets.clear()
 
@@ -1078,6 +1384,7 @@ class TwitterPlugin(Star):
             if umo in subscribers:
                 subs[username]["subscribers"][umo]["status"] = enabled
                 count += 1
+        self._set_config_umo_status(umo, enabled)
 
         if count > 0:
             await self._save_subs(subs)
