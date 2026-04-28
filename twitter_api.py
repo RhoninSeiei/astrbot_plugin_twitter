@@ -50,6 +50,37 @@ class TwitterAPI:
             await self._client.aclose()
             self._client = None
 
+    async def download_media(self, url: str, max_bytes: int) -> tuple[bytes, str]:
+        """通过当前 HTTP 客户端下载媒体文件"""
+        client = await self._get_client()
+        chunks: list[bytes] = []
+        total_size = 0
+
+        async with client.stream("GET", url, timeout=60.0) as resp:
+            resp.raise_for_status()
+            content_type = str(resp.headers.get("content-type") or "").split(";")[0]
+            content_length = resp.headers.get("content-length")
+            if content_length and max_bytes > 0:
+                try:
+                    if int(content_length) > max_bytes:
+                        raise ValueError(
+                            f"媒体文件超过大小限制: {content_length} > {max_bytes}"
+                        )
+                except ValueError:
+                    if str(content_length).isdigit():
+                        raise
+            async for chunk in resp.aiter_bytes():
+                if not chunk:
+                    continue
+                total_size += len(chunk)
+                if max_bytes > 0 and total_size > max_bytes:
+                    raise ValueError(
+                        f"媒体文件超过大小限制: {total_size} > {max_bytes}"
+                    )
+                chunks.append(chunk)
+
+        return b"".join(chunks), content_type
+
     async def check_website_available(self, website_list: list[str]) -> Optional[str]:
         """检测可用的镜像站，返回第一个可用的 URL"""
         client = await self._get_client()

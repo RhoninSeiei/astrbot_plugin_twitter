@@ -11,6 +11,24 @@
     "hint": "例如: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080",
     "default": ""
   },
+  "twitter_media_cache_max_mb": {
+    "description": "媒体缓存容量上限（MiB）",
+    "type": "int",
+    "default": 512,
+    "hint": "推文图片和视频会先通过插件代理下载到本地缓存，再以本地文件发送；超过容量后会删除较旧文件"
+  },
+  "twitter_media_cache_ttl_hours": {
+    "description": "媒体缓存保留时间（小时）",
+    "type": "int",
+    "default": 24,
+    "hint": "超过保留时间的媒体缓存会在后续下载前后清理"
+  },
+  "twitter_media_max_file_mb": {
+    "description": "单个媒体文件大小上限（MiB）",
+    "type": "int",
+    "default": 64,
+    "hint": "单张图片或单个视频超过此大小时会放弃下载；图片跳过发送，视频回退为文本链接"
+  },
   "twitter_poll_interval": {
     "description": "推文轮询间隔（分钟）",
     "type": "int",

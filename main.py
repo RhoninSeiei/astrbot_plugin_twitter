@@ -21,9 +21,15 @@ AstrBot Twitter 推文转发插件
 """
 
 import asyncio
+import hashlib
+import mimetypes
+import os
 import re
+import time
+import urllib.parse
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -42,6 +48,18 @@ TWITTER_LINK_PATTERN = re.compile(
 KV_SUBS_KEY = "twitter_subs"
 CONFIG_SUBS_KEY = "twitter_subscriptions"
 PREFERENCE_UNIQUE_ERROR = "UNIQUE constraint failed: preferences.scope"
+MEDIA_EXTENSIONS_BY_CONTENT_TYPE = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/quicktime": ".mov",
+    "application/vnd.apple.mpegurl": ".m3u8",
+    "application/x-mpegurl": ".m3u8",
+}
 
 
 @dataclass
@@ -84,6 +102,16 @@ class TwitterPlugin(Star):
         self.translate_provider_id = str(
             config.get("twitter_translate_provider_id", "") or ""
         ).strip()
+        self.media_cache_max_bytes = self._read_size_mb(
+            config, "twitter_media_cache_max_mb", 512
+        )
+        self.media_cache_ttl_seconds = self._read_hours(
+            config, "twitter_media_cache_ttl_hours", 24
+        )
+        self.media_max_file_bytes = self._read_size_mb(
+            config, "twitter_media_max_file_mb", 64
+        )
+        self.media_cache_dir = Path(__file__).resolve().parent / ".cache" / "media"
         custom_nitter_url = str(config.get("twitter_nitter_url", "") or "").strip()
 
         # 构建镜像站列表
@@ -466,6 +494,138 @@ class TwitterPlugin(Star):
             nickname += f" ({screen_name})"
         return nickname
 
+    @staticmethod
+    def _read_size_mb(config: AstrBotConfig, key: str, default: float) -> int:
+        """读取 MiB 配置并转换为字节数"""
+        try:
+            value = float(config.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(1, int(value * 1024 * 1024))
+
+    @staticmethod
+    def _read_hours(config: AstrBotConfig, key: str, default: float) -> float:
+        """读取小时配置并转换为秒数"""
+        try:
+            value = float(config.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(0.0, value * 3600)
+
+    @staticmethod
+    def _media_cache_key(url: str) -> str:
+        return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _guess_media_extension(
+        url: str, content_type: str = "", media_kind: str = "image"
+    ) -> str:
+        content_type = str(content_type or "").split(";")[0].strip().lower()
+        if content_type in MEDIA_EXTENSIONS_BY_CONTENT_TYPE:
+            return MEDIA_EXTENSIONS_BY_CONTENT_TYPE[content_type]
+
+        path = urllib.parse.urlparse(url).path
+        filename = urllib.parse.unquote(path.rsplit("/", 1)[-1])
+        ext = Path(filename).suffix.lower()
+        if ext:
+            return ext
+
+        guessed = mimetypes.guess_extension(content_type) if content_type else ""
+        if guessed:
+            return guessed
+        return ".mp4" if media_kind == "video" else ".jpg"
+
+    def _find_cached_media_file(self, url: str) -> Path | None:
+        if not self.media_cache_dir.exists():
+            return None
+        cache_key = self._media_cache_key(url)
+        matches = sorted(self.media_cache_dir.glob(f"{cache_key}.*"))
+        for path in matches:
+            if path.is_file() and not path.name.endswith(".tmp"):
+                return path
+        return None
+
+    def _cleanup_media_cache(self):
+        """清理过期或超过容量限制的媒体缓存"""
+        if not self.media_cache_dir.exists():
+            return
+
+        now = time.time()
+        files = [
+            path
+            for path in self.media_cache_dir.iterdir()
+            if path.is_file() and not path.name.endswith(".tmp")
+        ]
+
+        if self.media_cache_ttl_seconds > 0:
+            expire_before = now - self.media_cache_ttl_seconds
+            remaining = []
+            for path in files:
+                try:
+                    if path.stat().st_mtime < expire_before:
+                        path.unlink(missing_ok=True)
+                    else:
+                        remaining.append(path)
+                except OSError:
+                    continue
+            files = remaining
+
+        existing: list[tuple[float, int, Path]] = []
+        total_size = 0
+        for path in files:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            total_size += stat.st_size
+            existing.append((stat.st_mtime, stat.st_size, path))
+
+        if total_size <= self.media_cache_max_bytes:
+            return
+
+        for _mtime, size, path in sorted(existing):
+            try:
+                path.unlink(missing_ok=True)
+                total_size -= size
+            except OSError:
+                continue
+            if total_size <= self.media_cache_max_bytes:
+                break
+
+    async def _cache_media_url(self, url: str, media_kind: str) -> Path | None:
+        """通过插件代理客户端下载媒体并返回本地缓存文件"""
+        url = str(url or "").strip()
+        if not url.startswith(("http://", "https://")):
+            return None
+
+        self.media_cache_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_media_cache()
+
+        cached = self._find_cached_media_file(url)
+        if cached:
+            try:
+                os.utime(cached, None)
+            except OSError:
+                pass
+            return cached
+
+        if self.twitter_api is None:
+            return None
+
+        data, content_type = await self.twitter_api.download_media(
+            url, self.media_max_file_bytes
+        )
+        if not data:
+            return None
+
+        ext = self._guess_media_extension(url, content_type, media_kind)
+        target = self.media_cache_dir / f"{self._media_cache_key(url)}{ext}"
+        temp_target = target.with_name(f"{target.name}.tmp")
+        temp_target.write_bytes(data)
+        temp_target.replace(target)
+        self._cleanup_media_cache()
+        return target
+
     async def _maybe_translate(
         self, tweet_info: dict, umo: str
     ) -> tuple[str | None, str | None]:
@@ -591,7 +751,7 @@ class TwitterPlugin(Star):
         logger.warning("翻译全部重试失败，使用原文")
         return text, None
 
-    def _build_tweet_chain(
+    async def _build_tweet_chain(
         self,
         username: str,
         tweet_info: dict,
@@ -635,7 +795,10 @@ class TwitterPlugin(Star):
         # 图片
         for img_url in images:
             try:
-                img_comp = Comp.Image.fromURL(str(img_url))
+                img_path = await self._cache_media_url(str(img_url), "image")
+                if not img_path:
+                    raise RuntimeError("媒体缓存文件为空")
+                img_comp = Comp.Image.fromFileSystem(str(img_path))
                 if img_comp is not None:
                     chain.append(img_comp)
             except Exception as e:
@@ -645,7 +808,10 @@ class TwitterPlugin(Star):
         videos = tweet_info.get("videos") or []
         for v_url in videos:
             try:
-                video_comp = Comp.Video.fromURL(str(v_url))
+                video_path = await self._cache_media_url(str(v_url), "video")
+                if not video_path:
+                    raise RuntimeError("媒体缓存文件为空")
+                video_comp = Comp.Video.fromFileSystem(str(video_path))
                 if video_comp is not None:
                     chain.append(video_comp)
             except Exception as e:
@@ -811,7 +977,7 @@ class TwitterPlugin(Star):
     ):
         """向单个订阅者发送推文消息"""
         try:
-            chain = self._build_tweet_chain(
+            chain = await self._build_tweet_chain(
                 username, tweet_info, sub_config,
                 translated_text=translated_text,
                 translate_model=translate_model,
@@ -938,7 +1104,7 @@ class TwitterPlugin(Star):
 
                     for author in batch_authors:
                         for ct in seen_authors[author]:
-                            chain = self._build_tweet_chain(
+                            chain = await self._build_tweet_chain(
                                 ct.username, ct.tweet_info, ct.sub_config,
                                 translated_text=ct.translated_text,
                                 translate_model=ct.translate_model,
@@ -1441,7 +1607,7 @@ class TwitterPlugin(Star):
         )
 
         # 构建并返回消息
-        chain = self._build_tweet_chain(
+        chain = await self._build_tweet_chain(
             username, tweet_info,
             translated_text=translated_text,
             translate_model=translate_model,
@@ -1504,7 +1670,7 @@ class TwitterPlugin(Star):
             )
 
             # 构建推文消息链
-            chain = self._build_tweet_chain(
+            chain = await self._build_tweet_chain(
                 username,
                 tweet_info,
                 {"r18": True, "media": False, "status": True},

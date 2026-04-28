@@ -98,6 +98,9 @@ _✨ 基于 Nitter 镜像站的 Twitter 推文转发插件，支持多会话独�
 |--------|------|--------|------|
 | `twitter_nitter_url` | string | （空） | Nitter 镜像站地址，留空则使用内置列表自动切换（内置列表仅有1个且可能失效，强烈建议自定义） |
 | `twitter_proxy` | string | （空） | 代理地址，如 `http://127.0.0.1:7890` |
+| `twitter_media_cache_max_mb` | int | `512` | 推文媒体本地缓存容量上限（MiB） |
+| `twitter_media_cache_ttl_hours` | int | `24` | 推文媒体本地缓存保留时间（小时） |
+| `twitter_media_max_file_mb` | int | `64` | 单个推文媒体文件大小上限（MiB） |
 | `twitter_poll_interval` | int | `5` | 推文轮询间隔（分钟），建议不低于 3 |
 
 ### 消息格式

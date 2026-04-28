@@ -1,7 +1,9 @@
 import asyncio
 import copy
 import importlib
+import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -73,18 +75,32 @@ def install_astrbot_stubs():
             self.text = text
 
     class Image:
+        def __init__(self, file="", path="", url=""):
+            self.file = file
+            self.path = path
+            self.url = url
+
         @classmethod
         def fromURL(cls, url):
-            inst = cls()
-            inst.url = url
-            return inst
+            return cls(file=url, url=url)
+
+        @classmethod
+        def fromFileSystem(cls, path):
+            return cls(file=f"file:///{Path(path).resolve()}", path=str(path))
 
     class Video:
+        def __init__(self, file="", path="", url=""):
+            self.file = file
+            self.path = path
+            self.url = url
+
         @classmethod
         def fromURL(cls, url):
-            inst = cls()
-            inst.url = url
-            return inst
+            return cls(file=url, url=url)
+
+        @classmethod
+        def fromFileSystem(cls, path):
+            return cls(file=f"file:///{Path(path).resolve()}", path=str(path))
 
     class Node:
         def __init__(self, content=None, name=""):
@@ -143,6 +159,18 @@ class MemoryTwitterPlugin(twitter_main.TwitterPlugin):
         self.put_count = 0
         self.fail_next_put = False
         self._subs_lock = asyncio.Lock()
+        self.no_text = bool(self.config.get("twitter_no_text", False))
+        self.media_cache_max_bytes = int(
+            float(self.config.get("twitter_media_cache_max_mb", 512)) * 1024 * 1024
+        )
+        self.media_cache_ttl_seconds = (
+            float(self.config.get("twitter_media_cache_ttl_hours", 24)) * 3600
+        )
+        self.media_max_file_bytes = int(
+            float(self.config.get("twitter_media_max_file_mb", 64)) * 1024 * 1024
+        )
+        self.media_cache_dir = Path(tempfile.mkdtemp()) / "media"
+        self.twitter_api = None
 
     async def get_kv_data(self, key, default):
         if key != twitter_main.KV_SUBS_KEY:
@@ -175,7 +203,20 @@ class MemoryTwitterPlugin(twitter_main.TwitterPlugin):
         self.store = copy.deepcopy(value)
 
 
+class FakeMediaAPI:
+    def __init__(self, payloads):
+        self.payloads = payloads
+        self.calls = {}
+
+    async def download_media(self, url, max_bytes):
+        self.calls[url] = self.calls.get(url, 0) + 1
+        return self.payloads[url]
+
+
 class SubscriptionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        asyncio.get_running_loop().slow_callback_duration = 1.0
+
     async def test_save_subs_retries_and_merges_after_unique_conflict(self):
         plugin = MemoryTwitterPlugin()
         plugin.fail_next_put = True
@@ -339,6 +380,85 @@ class SubscriptionTests(unittest.IsolatedAsyncioTestCase):
             plugin.store["alice"]["subscribers"]["qq2:GroupMessage:new"],
             {"status": True, "r18": True, "media": False},
         )
+
+    async def test_tweet_chain_downloads_media_to_local_cache(self):
+        image_url = "https://nitter.net/pic/media%2Fabc.jpg"
+        video_url = "https://nitter.net/video/abc.mp4"
+        plugin = MemoryTwitterPlugin()
+        plugin.twitter_api = FakeMediaAPI(
+            {
+                image_url: (b"image-bytes", "image/jpeg"),
+                video_url: (b"video-bytes", "video/mp4"),
+            }
+        )
+
+        chain = await plugin._build_tweet_chain(
+            "alice",
+            {
+                "tweet_id": "1",
+                "screen_name": "Alice",
+                "text": "hello",
+                "images": [image_url],
+                "videos": [video_url],
+            },
+        )
+
+        images = [item for item in chain if isinstance(item, twitter_main.Comp.Image)]
+        videos = [item for item in chain if isinstance(item, twitter_main.Comp.Video)]
+        self.assertEqual(len(images), 1)
+        self.assertEqual(len(videos), 1)
+        self.assertTrue(images[0].file.startswith("file:///"))
+        self.assertTrue(videos[0].file.startswith("file:///"))
+        self.assertEqual(Path(images[0].path).read_bytes(), b"image-bytes")
+        self.assertEqual(Path(videos[0].path).read_bytes(), b"video-bytes")
+
+    async def test_tweet_chain_reuses_cached_media_file(self):
+        image_url = "https://nitter.net/pic/media%2Fsame.jpg"
+        plugin = MemoryTwitterPlugin()
+        plugin.twitter_api = FakeMediaAPI({image_url: (b"image-bytes", "image/jpeg")})
+        tweet_info = {
+            "tweet_id": "1",
+            "screen_name": "Alice",
+            "text": "hello",
+            "images": [image_url],
+            "videos": [],
+        }
+
+        first_chain = await plugin._build_tweet_chain("alice", tweet_info)
+        second_chain = await plugin._build_tweet_chain("alice", tweet_info)
+
+        first_image = next(
+            item for item in first_chain if isinstance(item, twitter_main.Comp.Image)
+        )
+        second_image = next(
+            item for item in second_chain if isinstance(item, twitter_main.Comp.Image)
+        )
+        self.assertEqual(first_image.path, second_image.path)
+        self.assertEqual(plugin.twitter_api.calls[image_url], 1)
+
+    async def test_media_cache_cleanup_removes_expired_and_oversized_files(self):
+        plugin = MemoryTwitterPlugin(
+            {
+                "twitter_media_cache_max_mb": 0.00001,
+                "twitter_media_cache_ttl_hours": 0.00001,
+            }
+        )
+        plugin.media_cache_dir.mkdir(parents=True, exist_ok=True)
+        expired_file = plugin.media_cache_dir / "expired.jpg"
+        large_file = plugin.media_cache_dir / "large.jpg"
+        fresh_file = plugin.media_cache_dir / "fresh.jpg"
+        expired_file.write_bytes(b"old")
+        large_file.write_bytes(b"x" * 12)
+        fresh_file.write_bytes(b"ok")
+        old_time = 1
+        os.utime(expired_file, (old_time, old_time))
+        os.utime(large_file, (old_time + 1, old_time + 1))
+
+        plugin._cleanup_media_cache()
+
+        self.assertFalse(expired_file.exists())
+        self.assertFalse(large_file.exists())
+        self.assertTrue(fresh_file.exists())
 
 
 if __name__ == "__main__":
